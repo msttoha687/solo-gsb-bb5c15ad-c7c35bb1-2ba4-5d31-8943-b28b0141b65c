@@ -95,3 +95,7 @@ Content-Type: application/json
 
 ### 12. 手动重算（通常无需调用，提交读数后自动完成）
 POST {{baseUrl}}/samples/{{sampleId}}/recompute
+
+### 13. 温度一致性核查（需先登记记录仪、绑定窗口并提交记录仪读数，见 README 示例）
+###     最大事件时间差 120 秒、温差阈值 2°C：返回温差严格 > 2°C 的不交叉配对明细
+GET {{baseUrl}}/samples/{{sampleId}}/logger-consistency?logger_id=logger-truck-07&max_time_diff_seconds=120&temperature_diff_threshold_c=2

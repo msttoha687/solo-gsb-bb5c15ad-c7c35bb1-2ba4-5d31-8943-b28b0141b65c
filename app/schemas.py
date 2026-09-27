@@ -307,3 +307,37 @@ class LoggerReadingsResponse(BaseModel):
     affected_samples: list[str]
     # 这些样本重算后新产生的告警（跨样本）
     new_alerts: list[AlertOut]
+
+
+# ---------------- 温度一致性核查 ----------------
+
+
+class ConsistencyPairOut(BaseModel):
+    # 样本直接读数一侧
+    direct_reading_id: int
+    direct_event_time: datetime
+    direct_temperature_c: float
+    # 当前有效归属的记录仪读数一侧
+    logger_reading_id: int
+    logger_event_time: datetime
+    logger_temperature_c: float
+    # 两侧事件时间绝对差（秒）与温差绝对值（°C）
+    time_diff_seconds: float
+    temperature_diff_c: float
+
+
+class ConsistencyCheckResponse(BaseModel):
+    sample_id: str
+    logger_id: str
+    max_time_diff_seconds: float
+    temperature_diff_threshold_c: float
+    # 一对一配对总数（正常配对 + 温差异常配对）
+    pair_count: int
+    # 温差严格大于阈值的配对明细（按事件时间顺序）
+    mismatches: list[ConsistencyPairOut]
+    mismatch_count: int
+    # 未参与配对的直接读数 / 记录仪读数数量（不算温差异常）
+    direct_unpaired_count: int
+    logger_unpaired_count: int
+    # 第 2 优化目标达成值：全部配对的绝对时间差总和（秒）
+    total_abs_time_diff_seconds: float

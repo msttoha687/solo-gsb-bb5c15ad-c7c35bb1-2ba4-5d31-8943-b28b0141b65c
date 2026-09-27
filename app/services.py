@@ -985,3 +985,79 @@ def get_db_connection() -> sqlite3.Connection:
         yield conn
     finally:
         conn.close()
+
+
+# ---------------- 温度一致性核查 ----------------
+
+
+def temperature_consistency_check(
+    conn: sqlite3.Connection,
+    sample_id: str,
+    logger_id: str,
+    max_time_diff_seconds: float,
+    temperature_diff_threshold_c: float,
+) -> dict:
+    """样本直接读数与当前有效归属的指定记录仪读数做不交叉一对一配对核查。
+
+    只读操作：直接读取 ``readings`` 与经 ``reading_attributions`` 当前归属的
+    ``logger_readings``（迟到读数、绑定调整后的最新归属在此自然反映），
+    不改动任何读数及既有的冻融循环、剂量、告警结果。
+    配对由 :func:`app.matching.match_temperatures` 纯函数完成；
+    返回配对统计与温差严格大于阈值的配对明细。
+    """
+
+    from .matching import MatchPoint, match_temperatures
+
+    direct_rows = conn.execute(
+        "SELECT id, event_time, temperature_c FROM readings "
+        "WHERE sample_id = ? ORDER BY event_time, id",
+        (sample_id,),
+    ).fetchall()
+    logger_rows = conn.execute(
+        """
+        SELECT lr.id, lr.event_time, lr.temperature_c
+        FROM reading_attributions ra
+        JOIN logger_readings lr ON lr.id = ra.logger_reading_id
+        WHERE ra.sample_id = ? AND lr.logger_id = ?
+        ORDER BY lr.event_time, lr.id
+        """,
+        (sample_id, logger_id),
+    ).fetchall()
+
+    direct = [
+        MatchPoint(
+            id=row["id"],
+            event_time=row["event_time"],
+            temperature_c=row["temperature_c"],
+        )
+        for row in direct_rows
+    ]
+    attributed = [
+        MatchPoint(
+            id=row["id"],
+            event_time=row["event_time"],
+            temperature_c=row["temperature_c"],
+        )
+        for row in logger_rows
+    ]
+
+    result = match_temperatures(
+        direct, attributed, max_time_diff_seconds=max_time_diff_seconds
+    )
+    mismatches = [
+        pair
+        for pair in result.pairs
+        if pair.temperature_diff_c > temperature_diff_threshold_c
+    ]
+    return {
+        "sample_id": sample_id,
+        "logger_id": logger_id,
+        "max_time_diff_seconds": max_time_diff_seconds,
+        "temperature_diff_threshold_c": temperature_diff_threshold_c,
+        "pair_count": result.pair_count,
+        "mismatches": mismatches,
+        "mismatch_count": len(mismatches),
+        "direct_unpaired_count": result.direct_unpaired_count,
+        "logger_unpaired_count": result.logger_unpaired_count,
+        "total_abs_time_diff_seconds": result.total_abs_time_diff_seconds,
+    }

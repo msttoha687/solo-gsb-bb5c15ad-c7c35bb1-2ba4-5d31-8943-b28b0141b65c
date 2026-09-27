@@ -997,3 +997,165 @@ def test_logger_readings_before_binding_are_attributed_when_bound(client) -> Non
     rows = client.get("/samples/s1/readings?source=logger").json()
     assert [x["event_id"] for x in rows] == ["g1", "g2", "g3"]
     assert client.get("/samples/s1/state").json()["cycle_count"] == 1
+
+
+# ---------------- 温度一致性核查 ----------------
+
+
+def _consistency(client, sid, lid, window, threshold, expected=200):
+    return client.get(
+        f"/samples/{sid}/logger-consistency",
+        params={
+            "logger_id": lid,
+            "max_time_diff_seconds": window,
+            "temperature_diff_threshold_c": threshold,
+        },
+    )
+
+
+def _setup_consistency(client):
+    _create_sample(client)
+    _register_logger(client)
+    _bind(client, "s1", "lg1", "2026-09-20T08:00:00Z", "2026-09-20T12:00:00Z")
+    _submit(client, "s1", [
+        {"event_id": "d1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": 4.0},
+        {"event_id": "d2", "event_time": "2026-09-20T09:00:00Z", "temperature_c": -25.0},
+        {"event_id": "d3", "event_time": "2026-09-20T10:00:00Z", "temperature_c": 2.0},
+    ])
+    _logger_submit(client, "lg1", [
+        # 与 d1 差 30 秒、温差 0.5：正常配对
+        {"event_id": "g1", "event_time": "2026-09-20T08:00:30Z", "temperature_c": 4.5},
+        # 与 d2 同时刻、温差 5.0：异常配对（阈值 2）
+        {"event_id": "g2", "event_time": "2026-09-20T09:00:00Z", "temperature_c": -20.0},
+        # 与 d3 差 5 分钟：窗口 120 秒内配不上 -> 两侧各留一条未配对
+        {"event_id": "g3", "event_time": "2026-09-20T10:05:00Z", "temperature_c": 2.2},
+    ])
+
+
+def test_logger_consistency_pairing_and_mismatches(client) -> None:
+    _setup_consistency(client)
+    r = _consistency(client, "s1", "lg1", 120, 2.0)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sample_id"] == "s1"
+    assert body["logger_id"] == "lg1"
+    assert body["max_time_diff_seconds"] == 120.0
+    assert body["temperature_diff_threshold_c"] == 2.0
+    # d1-g1、d2-g2 两对；d3、g3 未配对（不视为异常）
+    assert body["pair_count"] == 2
+    assert body["direct_unpaired_count"] == 1
+    assert body["logger_unpaired_count"] == 1
+    assert body["mismatch_count"] == 1
+    m = body["mismatches"][0]
+    assert m["direct_reading_id"] == 2
+    assert m["logger_reading_id"] == 2
+    assert m["direct_temperature_c"] == -25.0
+    assert m["logger_temperature_c"] == -20.0
+    assert m["time_diff_seconds"] == 0.0
+    assert m["temperature_diff_c"] == 5.0
+    # 正常配对 d1-g1 占用读数但不在异常明细里
+    assert body["total_abs_time_diff_seconds"] == 30.0
+    assert [x["direct_event_time"] for x in body["mismatches"]] == sorted(
+        x["direct_event_time"] for x in body["mismatches"]
+    )
+
+
+def test_logger_consistency_threshold_is_strict_and_params_validated(client) -> None:
+    _setup_consistency(client)
+    # 温差恰好等于阈值（5.0）：不算异常
+    body = _consistency(client, "s1", "lg1", 120, 5.0).json()
+    assert body["mismatch_count"] == 0
+    assert body["pair_count"] == 2
+
+    # 时间差窗口取等号：d3(10:00) 与 g3(10:05) 恰好 300 秒可配对
+    body = _consistency(client, "s1", "lg1", 300, 2.0).json()
+    assert body["pair_count"] == 3
+    assert body["direct_unpaired_count"] == 0
+    assert body["logger_unpaired_count"] == 0
+    # g3 温差 0.2 正常
+    assert body["mismatch_count"] == 1
+
+    # 非负约束：负值参数 422
+    assert _consistency(client, "s1", "lg1", -1, 2.0).status_code == 422
+    assert _consistency(client, "s1", "lg1", 120, -0.1).status_code == 422
+    # 缺少必填参数 422
+    assert client.get(
+        "/samples/s1/logger-consistency",
+        params={"logger_id": "lg1", "max_time_diff_seconds": 120},
+    ).status_code == 422
+
+
+def test_logger_consistency_404(client) -> None:
+    _setup_consistency(client)
+    assert _consistency(client, "nope", "lg1", 120, 2.0).status_code == 404
+    assert _consistency(client, "s1", "nope", 120, 2.0).status_code == 404
+
+
+def test_logger_consistency_reflects_late_reading_and_binding_change(client) -> None:
+    _setup_consistency(client)
+    # 迟到记录仪读数 g1.5（08:01，归属窗口内）：与 d1(08:00) 差 60 秒、温差 3.0；
+    # 配对最多目标下 d1 会改配 g1（30 秒）还是 g1.5（60 秒）？
+    # g1 与 g1.5 都只能与 d1 配（d2 在 09:00，窗口 120 秒够不到 08:01），
+    # 最大配对数不变（2 对），总时间差最小 => d1 仍配更近的 g1(30 秒)；
+    # 迟到读数本身成为未配对记录仪读数，不产生异常。
+    _logger_submit(client, "lg1", [
+        {"event_id": "g1-late", "event_time": "2026-09-20T08:01:00Z", "temperature_c": 1.0},
+    ])
+    body = _consistency(client, "s1", "lg1", 120, 2.0).json()
+    assert body["pair_count"] == 2
+    assert body["mismatch_count"] == 1
+    assert body["logger_unpaired_count"] == 2  # g3 与迟到读数均未配对
+
+    # 若只允许 40 秒：迟到的 08:01 配不上，而 g1(08:00:30) 仍与 d1 配对
+    body = _consistency(client, "s1", "lg1", 40, 2.0).json()
+    assert body["pair_count"] == 2
+    assert body["mismatch_count"] == 1
+
+    # 绑定窗口缩小为 [08:00, 08:30)：g2(09:00) 归属被撤销 -> 异常消失
+    bid = client.get("/samples/s1/logger-bindings").json()[0]["id"]
+    r = client.patch(
+        f"/logger-bindings/{bid}",
+        json={"start_time": "2026-09-20T08:00:00Z", "end_time": "2026-09-20T08:30:00Z"},
+    )
+    assert r.status_code == 200
+    body = _consistency(client, "s1", "lg1", 120, 2.0).json()
+    # 窗口内仅剩 g1 / g1-late 两条记录仪读数，仅 d1 能配（取更近的 g1）
+    assert body["pair_count"] == 1
+    assert body["mismatch_count"] == 0
+    assert body["direct_unpaired_count"] == 2
+    assert body["logger_unpaired_count"] == 1
+
+
+def test_logger_consistency_is_read_only(client) -> None:
+    """核查接口不得改动读数，也不影响冻融循环/剂量/告警结果。"""
+
+    _create_sample(client, min_allowed_c=-80, max_allowed_c=8)
+    _register_logger(client)
+    _bind(client, "s1", "lg1", "2026-09-20T08:00:00Z", "2026-09-20T12:00:00Z")
+    _submit(client, "s1", [
+        {"event_id": "d1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": -25.0},
+        {"event_id": "d2", "event_time": "2026-09-20T09:00:00Z", "temperature_c": 2.0},
+    ])
+    _logger_submit(client, "lg1", [
+        {"event_id": "g1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": -90.0},
+    ])
+    state_before = client.get("/samples/s1/state").json()
+    alerts_before = client.get("/alerts?sample_id=s1").json()
+
+    assert _consistency(client, "s1", "lg1", 120, 1.0).status_code == 200
+    # 重复核查结果一致（无副作用）
+    assert _consistency(client, "s1", "lg1", 120, 1.0).json() == _consistency(
+        client, "s1", "lg1", 120, 1.0
+    ).json()
+
+    state_after = client.get("/samples/s1/state").json()
+    alerts_after = client.get("/alerts?sample_id=s1").json()
+    assert state_after == state_before
+    assert {(a["id"], a["alert_type"], a["acknowledged"]) for a in alerts_after} == {
+        (a["id"], a["alert_type"], a["acknowledged"]) for a in alerts_before
+    }
+    # 直接读数与记录仪原始读数均不被改动
+    assert [x["event_id"] for x in client.get("/samples/s1/readings?source=direct").json()] == [
+        "d1", "d2"
+    ]
+    assert len(client.get("/loggers/lg1/readings").json()) == 1
