@@ -95,3 +95,30 @@ Content-Type: application/json
 
 ### 12. 手动重算（通常无需调用，提交读数后自动完成）
 POST {{baseUrl}}/samples/{{sampleId}}/recompute
+
+### 13. 登记共享记录仪并提交读数
+POST {{baseUrl}}/loggers
+Content-Type: application/json
+
+{"id": "logger-truck-07", "name": "7 号冷链车厢记录仪"}
+
+###
+POST {{baseUrl}}/loggers/logger-truck-07/readings
+Content-Type: application/json
+
+{
+  "readings": [
+    {"event_id": "lg-1", "event_time": "2026-09-20T08:00:30Z", "temperature_c": 4.2},
+    {"event_id": "lg-2", "event_time": "2026-09-20T08:30:20Z", "temperature_c": -21.5},
+    {"event_id": "lg-3", "event_time": "2026-09-20T10:30:10Z", "temperature_c": 2.4}
+  ]
+}
+
+### 14. 为样本设置记录仪绑定时段（左闭右开）
+POST {{baseUrl}}/samples/{{sampleId}}/logger-bindings?logger_id=logger-truck-07
+Content-Type: application/json
+
+{"start_time": "2026-09-20T08:00:00Z", "end_time": "2026-09-20T12:00:00Z"}
+
+### 15. 样本 × 记录仪温度一致性核查（最大时间差 300 秒、温差阈值 2°C；只读）
+GET {{baseUrl}}/samples/{{sampleId}}/logger-consistency/logger-truck-07?max_time_diff_seconds=300&temp_diff_threshold_c=2.0

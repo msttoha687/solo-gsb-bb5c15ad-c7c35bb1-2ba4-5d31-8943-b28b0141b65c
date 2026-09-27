@@ -68,3 +68,23 @@ curl -sS "$BASE/samples/$SID/cycles"; echo
 
 echo "== 全部告警 =="
 curl -sS "$BASE/alerts?sample_id=$SID"; echo
+
+echo "== 登记共享记录仪并提交读数 =="
+curl -sS -X POST "$BASE/loggers" -H 'Content-Type: application/json' -d '{
+  "id": "logger-truck-07", "name": "7 号冷链车厢记录仪"
+}'; echo
+curl -sS -X POST "$BASE/loggers/logger-truck-07/readings" -H 'Content-Type: application/json' -d '{
+  "readings": [
+    {"event_id": "lg-1", "event_time": "2026-09-20T08:00:30Z", "temperature_c": 4.2},
+    {"event_id": "lg-2", "event_time": "2026-09-20T08:30:20Z", "temperature_c": -21.5},
+    {"event_id": "lg-3", "event_time": "2026-09-20T10:30:10Z", "temperature_c": 2.4}
+  ]
+}'; echo
+
+echo "== 为样本设置记录仪绑定时段（左闭右开 [08:00, 12:00)）=="
+curl -sS -X POST "$BASE/samples/$SID/logger-bindings?logger_id=logger-truck-07" \
+  -H 'Content-Type: application/json' \
+  -d '{"start_time": "2026-09-20T08:00:00Z", "end_time": "2026-09-20T12:00:00Z"}'; echo
+
+echo "== 样本 × 记录仪温度一致性核查（最大时间差 300 秒、温差阈值 2°C；只读）=="
+curl -sS "$BASE/samples/$SID/logger-consistency/logger-truck-07?max_time_diff_seconds=300&temp_diff_threshold_c=2.0"; echo

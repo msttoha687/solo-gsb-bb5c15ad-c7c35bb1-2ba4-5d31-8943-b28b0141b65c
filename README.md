@@ -13,6 +13,9 @@
   **左闭右开时段**；记录仪读数仅归入发生时间落在绑定时段内的样本（同一读数可归入多个样本），
   与样本直接读数合并到同一条时间轴上重算冻融循环、剂量与告警；迟到读数或绑定时段变更会
   撤销旧归属并重建受影响样本；
+- 提供**样本 × 记录仪温度一致性核查**：取样本直接读数与当前有效归属的该记录仪读数，
+  按事件时间顺序做**不交叉一对一配对**（配对数最多 → 总时间差最小 → 读数 ID 序列稳定取舍），
+  返回温差严格大于阈值的配对明细与配对 / 两侧未配对数量；只读查询，不改写任何既有结果；
 - 容器启动即自动初始化数据库（建表、索引），旧版本数据库自动兼容迁移。
 
 ## 目录结构
@@ -21,10 +24,11 @@
 app/
   main.py        # FastAPI 路由与启动初始化
   engine.py      # 纯函数冻融状态机（循环识别 + 告警推导），不依赖 Web/DB
+  matching.py    # 纯函数一致性配对（不交叉一对一最优配对），不依赖 Web/DB
   database.py    # SQLite 连接与幂等建表脚本
   schemas.py     # Pydantic 请求/响应模型
-  services.py    # 业务层：幂等写入、时间重排重算、告警确认
-tests/           # pytest：引擎单元测试 + API 集成测试
+  services.py    # 业务层：幂等写入、时间重排重算、告警确认、一致性核查
+tests/           # pytest：引擎/配对单元测试 + API 集成测试
 examples/        # requests.http / demo.sh 示例请求
 Dockerfile
 docker-compose.yml
@@ -148,6 +152,48 @@ PATCH 样本的阈值、允许区间、循环上限、剂量预算或最大可�
   为直接读数与记录仪归属读数合并后的时间轴（返回项带 `source`、`logger_id`、`logger_reading_id`）；
 - `GET /samples/{id}/state` 的最近读数/循环/剂量同样基于合并时间轴。
 
+## 样本 × 记录仪温度一致性核查
+
+`GET /samples/{sample_id}/logger-consistency/{logger_id}?max_time_diff_seconds=300&temp_diff_threshold_c=2.0`
+
+用于核查“样本直接读数”与“共享记录仪读数”是否一致（例如样本自带探头与车厢记录仪互证）：
+
+1. **取数**：样本的全部直接读数，以及**当前有效归属**于该样本的该记录仪读数
+   （即落在现行绑定时段内的归属读数；迟到读数、绑定新建 / PATCH / DELETE 后的
+   查询立即反映最新归属）；
+2. **配对**：两侧分别按 `(event_time, id)` 升序，做**不交叉的一对一配对**
+   （保序：若两对配对交叉，即直接读数 a₁ 在 a₂ 前、而其配对记录仪读数却在
+   a₂ 的配对读数之后，则不允许）。仅当两条读数
+   事件时间差的绝对值 `<= max_time_diff_seconds`（非负，恰好等于也可配对）时才允许配对。
+   配对目标按字典序依次取舍：
+   1. **配对数最多**；
+   2. **总时间差最小**（各配对时间差绝对值之和）；
+   3. 仍相同时，**配对读数 ID 序列** `[(直接读数 id, 记录仪读数 id), ...]`
+      按字典序取最小——结果稳定、可复现；
+3. **判定**：配对温差（绝对值）**严格大于** `temp_diff_threshold_c`（非负）的配对
+   计入异常明细；**正常配对同样占用读数**，未配对读数不参与温差判定
+   （未配对不算温差异常）。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `paired_count` | 成功配对的读数对数（含温差正常的配对） |
+| `unmatched_sample_count` / `unmatched_logger_count` | 两侧各自未配对的读数条数 |
+| `anomaly_count` / `anomalies` | 温差超限的配对数与明细（按事件时间顺序） |
+| `anomalies[].reading_id` / `logger_reading_id` | 配对两侧读数 ID（`readings.id` / `logger_readings.id`） |
+| `anomalies[].sample_event_time` / `logger_event_time` | 两侧事件时间 |
+| `anomalies[].sample_temperature_c` / `logger_temperature_c` | 两侧温度（°C） |
+| `anomalies[].time_diff_seconds` / `temperature_diff_c` | 该配对的时间差（秒）与温差（°C），均为绝对值 |
+
+本接口为**只读查询**：不改动原始读数、归属关系与既有冻融循环、暴露剂量、告警结果。
+
+示例：
+
+```bash
+curl 'http://localhost:8000/samples/sample-demo-001/logger-consistency/logger-truck-07?max_time_diff_seconds=300&temp_diff_threshold_c=2.0'
+```
+
 ## 幂等去重
 
 - 提供 `event_id` 时：`(sample_id, event_id)` 唯一，重复提交直接跳过；
@@ -173,6 +219,7 @@ PATCH 样本的阈值、允许区间、循环上限、剂量预算或最大可�
 | POST/GET | `/samples/{id}/logger-bindings?logger_id=...` | 设置记录仪左闭右开绑定时段 / 样本绑定列表（同时段不重叠） |
 | GET | `/loggers/{id}/bindings` | 该记录仪对各样本的绑定列表 |
 | PATCH/DELETE | `/logger-bindings/{id}` | 修改 / 删除绑定时段（撤销旧归属、重建并重算样本） |
+| GET | `/samples/{id}/logger-consistency/{logger_id}?max_time_diff_seconds=...&temp_diff_threshold_c=...` | **温度一致性核查**：直接读数与当前归属记录仪读数不交叉一对一最优配对，返回温差超限配对明细与配对/未配对数量（只读） |
 | GET | `/samples/{id}/state` | **当前状态**、循环次数、双向暴露剂量/缺口/预算使用率、未确认告警数、最近读数 |
 | GET | `/samples/{id}/cycles` | **完整冻融循环明细** |
 | POST | `/samples/{id}/recompute` | 手动重算 |
@@ -269,6 +316,10 @@ curl -X POST http://localhost:8000/loggers/logger-truck-07/readings \
   -d '{"readings": [
     {"event_id": "lg-late", "event_time": "2026-09-20T09:00:00Z", "temperature_c": -25.0}
   ]}'
+
+# 6. 温度一致性核查：样本直接读数 vs 当前归属的记录仪读数
+#    （最大时间差 300 秒、温差阈值 2°C；只读，不影响冻融/剂量/告警）
+curl 'http://localhost:8000/samples/sample-demo-001/logger-consistency/logger-truck-07?max_time_diff_seconds=300&temp_diff_threshold_c=2.0'
 ```
 
 ## 时间处理
@@ -319,4 +370,7 @@ pytest -q
 配置变更可逆重算、旧版数据库 ALTER TABLE 迁移；共享记录仪部分覆盖登记/读数幂等、
 左闭右开窗口与同一样本时段重叠拒绝、一读多样本归属、与直接读数合并重算冻融/剂量、
 迟到读数与窗口 PATCH/DELETE 的归属撤销与无重复重建、直接读数不被改动、
-记录仪来源告警的去重与确认保留、样本/记录仪删除级联。
+记录仪来源告警的去重与确认保留、样本/记录仪删除级联；一致性核查部分覆盖
+不交叉一对一配对的三级目标取舍（配对数最多、总时间差最小、读数 ID 序列稳定）、
+时间差边界与零窗口、温差严格超限判定、两侧未配对计数、迟到读数与绑定调整后的
+最新归属反映、核查只读不改写既有结果、参数校验（负值 422、缺失 422、不存在 404）。

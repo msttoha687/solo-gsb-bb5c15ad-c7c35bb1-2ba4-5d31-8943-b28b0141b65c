@@ -19,6 +19,7 @@ from .schemas import (
     LoggerBindingIn,
     LoggerBindingOut,
     LoggerBindingUpdate,
+    LoggerConsistencyResponse,
     LoggerCreate,
     LoggerOut,
     LoggerReadingOut,
@@ -50,6 +51,9 @@ app = FastAPI(
         "支持共享温度记录仪：登记记录仪与读数，并以左闭右开时段绑定到样本，"
         "记录仪读数按发生时间归入绑定窗口内的样本（一读多样本），"
         "与样本直接读数一起重算冻融循环、暴露剂量与告警。"
+        "另提供样本 × 记录仪温度一致性核查：对样本直接读数与当前归属的记录仪读数"
+        "做不交叉一对一最优配对（配对数最多、总时间差最小、读数 ID 序列稳定取舍），"
+        "返回温差超限配对明细与配对/未配对数量。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -463,3 +467,36 @@ def update_binding(
 def delete_binding(binding_id: int, conn=Depends(services.get_db_connection)):
     if not services.delete_binding(conn, binding_id):
         raise HTTPException(status_code=404, detail="绑定不存在")
+
+
+# ---------------- 样本 × 记录仪温度一致性核查 ----------------
+
+
+@app.get(
+    "/samples/{sample_id}/logger-consistency/{logger_id}",
+    response_model=LoggerConsistencyResponse,
+    tags=["loggers"],
+)
+def check_logger_consistency(
+    sample_id: str,
+    logger_id: str,
+    max_time_diff_seconds: float = Query(
+        ..., ge=0, description="允许配对的最大事件时间差（秒，非负；恰好等于也可配对）"
+    ),
+    temp_diff_threshold_c: float = Query(
+        ..., ge=0, description="温差异常阈值（°C，非负）；配对温差严格大于该值才计入异常"
+    ),
+    conn=Depends(services.get_db_connection),
+):
+    """样本直接读数 vs 当前有效归属的该记录仪读数：不交叉一对一最优配对。
+
+    配对目标按字典序：配对数最多 → 总时间差最小 → 配对读数 ID 序列稳定取舍。
+    只读接口：迟到读数 / 绑定调整后的查询反映最新归属，
+    不改动原读数与既有冻融、剂量、告警结果；未配对读数不算温差异常。
+    """
+
+    _require_sample(conn, sample_id)
+    _require_logger(conn, logger_id)
+    return services.logger_consistency_check(
+        conn, sample_id, logger_id, max_time_diff_seconds, temp_diff_threshold_c
+    )

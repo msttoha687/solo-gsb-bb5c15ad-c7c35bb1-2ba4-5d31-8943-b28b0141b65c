@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from . import engine
+from . import engine, matching
 from .database import connect
 
 # SQLite 单文件写入需要串行化；批量提交 + 重算整体持锁。
@@ -975,6 +975,79 @@ def delete_binding(conn: sqlite3.Connection, binding_id: int) -> bool:
         reconcile_sample(conn, sample_id, lock_held=True)
         recompute(conn, sample_id, lock_held=True)
     return True
+
+
+# ---------------- 样本 × 记录仪温度一致性核查 ----------------
+
+# 温差严格大于阈值才判异常；浮点临界（表示误差在 1e-9 内）按不超限处理
+_TEMP_DIFF_EPS = 1e-9
+
+
+def logger_consistency_check(
+    conn: sqlite3.Connection,
+    sample_id: str,
+    logger_id: str,
+    max_time_diff_seconds: float,
+    temp_diff_threshold_c: float,
+) -> dict:
+    """样本直接读数与当前有效归属的该记录仪读数做最优一一配对，筛出温差超限配对。
+
+    只读查询：归属表随迟到读数 / 绑定变更实时对账，本函数直接读取最新归属，
+    不改动任何读数、归属、循环、剂量或告警数据。
+    """
+
+    direct = list(
+        conn.execute(
+            "SELECT id, event_time, temperature_c FROM readings "
+            "WHERE sample_id = ? ORDER BY event_time, id",
+            (sample_id,),
+        )
+    )
+    attributed = list(
+        conn.execute(
+            """
+            SELECT lr.id, lr.event_time, lr.temperature_c
+            FROM reading_attributions ra
+            JOIN logger_readings lr ON lr.id = ra.logger_reading_id
+            WHERE ra.sample_id = ? AND lr.logger_id = ?
+            ORDER BY lr.event_time, lr.id
+            """,
+            (sample_id, logger_id),
+        )
+    )
+    pairs = matching.match_pairs(
+        [matching.SideReading(**row) for row in direct],
+        [matching.SideReading(**row) for row in attributed],
+        max_time_diff_seconds,
+    )
+    anomalies = [
+        p
+        for p in pairs
+        if p.temperature_diff_c > temp_diff_threshold_c + _TEMP_DIFF_EPS
+    ]
+    return {
+        "sample_id": sample_id,
+        "logger_id": logger_id,
+        "max_time_diff_seconds": max_time_diff_seconds,
+        "temp_diff_threshold_c": temp_diff_threshold_c,
+        "paired_count": len(pairs),
+        "unmatched_sample_count": len(direct) - len(pairs),
+        "unmatched_logger_count": len(attributed) - len(pairs),
+        "anomaly_count": len(anomalies),
+        "anomalies": [
+            {
+                "reading_id": p.sample_reading_id,
+                "logger_reading_id": p.logger_reading_id,
+                "sample_event_time": p.sample_event_time,
+                "logger_event_time": p.logger_event_time,
+                "sample_temperature_c": p.sample_temperature_c,
+                "logger_temperature_c": p.logger_temperature_c,
+                "time_diff_seconds": round(p.time_diff_seconds, 6),
+                "temperature_diff_c": round(p.temperature_diff_c, 6),
+            }
+            for p in anomalies
+        ],
+    }
 
 
 def get_db_connection() -> sqlite3.Connection:

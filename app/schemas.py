@@ -307,3 +307,31 @@ class LoggerReadingsResponse(BaseModel):
     affected_samples: list[str]
     # 这些样本重算后新产生的告警（跨样本）
     new_alerts: list[AlertOut]
+
+
+# ---------------- 样本 × 记录仪温度一致性核查 ----------------
+
+
+class ConsistencyPairOut(BaseModel):
+    """一对配对读数中温差超限的明细（两侧读数 ID、时间、温度与时间差/温差）。"""
+
+    reading_id: int = Field(..., description="样本直接读数 ID（readings.id）")
+    logger_reading_id: int = Field(..., description="记录仪读数 ID（logger_readings.id）")
+    sample_event_time: datetime
+    logger_event_time: datetime
+    sample_temperature_c: float
+    logger_temperature_c: float
+    time_diff_seconds: float = Field(..., description="两侧事件时间差的绝对值（秒）")
+    temperature_diff_c: float = Field(..., description="两侧温差的绝对值（°C）")
+
+
+class LoggerConsistencyResponse(BaseModel):
+    sample_id: str
+    logger_id: str
+    max_time_diff_seconds: float
+    temp_diff_threshold_c: float
+    paired_count: int = Field(..., description="成功配对的读数对数（含温差正常的配对）")
+    unmatched_sample_count: int = Field(..., description="未配对的样本直接读数条数")
+    unmatched_logger_count: int = Field(..., description="未配对的记录仪归属读数条数")
+    anomaly_count: int = Field(..., description="温差严格大于阈值的配对数")
+    anomalies: list[ConsistencyPairOut]
